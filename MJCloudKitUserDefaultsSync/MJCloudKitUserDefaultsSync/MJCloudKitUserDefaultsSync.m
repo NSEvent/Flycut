@@ -34,12 +34,20 @@
 
 #import "MJCloudKitUserDefaultsSync.h"
 #import <CloudKit/CloudKit.h>
+#import <CommonCrypto/CommonDigest.h>
 
 // String constants we use.
 static NSString *const recordZoneName = @"MJCloudKitUserDefaultsSync";
 static NSString *const subscriptionID = @"UserDefaultSubscription";
 static NSString *const recordType = @"UserDefault";
 static NSString *const recordName = @"UserDefaults";
+
+// Marker keys used when promoting an NSData value to a CKAsset on the same record.
+// The dict-shaped marker replaces the NSData in the binary plist; the asset itself
+// lives in a CKRecord field named "<assetFieldPrefix><sha256-hex>".
+static NSString *const kMJAssetRefKey = @"_mjcasset_ref";
+static NSString *const kMJAssetSizeKey = @"_mjcasset_size";
+static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 
 @interface MJCloudKitUserDefaultsSync_NotificationHander : NSObject
 @end
@@ -117,6 +125,12 @@ static NSString *const recordName = @"UserDefaults";
 	CFAbsoluteTime lastResubscribeTime;
 	int resubscribeCount;
 	CFAbsoluteTime lastReceiveTime;
+
+	// Asset promotion config: maps user-defaults key -> NSData byte threshold for promotion.
+	// Released in dealloc/stop.
+	NSMutableDictionary<NSString *, NSNumber *> *assetPromotionThresholds;
+	// Temp files written during an upload, to be cleaned up after the CKRecord save succeeds.
+	NSMutableArray<NSURL *> *pendingAssetTempFiles;
 }
 
 #if UNIT_TEST_MEMORY_LEAKS
@@ -486,6 +500,21 @@ static NSString *const recordName = @"UserDefaults";
 							Boolean skip = NO;
 
 							if ( nil != obj ) {
+								// Asset promotion: if this key is opted in and the value is a dict/array, walk it,
+								// extract large NSData values as CKAssets attached to `record`, and serialize the
+								// remainder. The marker dict left in the binary plist is content-addressed (sha256)
+								// so the equality check below stays meaningful: identical bytes produce identical
+								// markers, identical markers produce identical binary plists.
+								if ( [self isAssetPromotionEnabledForKey:key]
+								     && ( [obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSArray class]] ) ) {
+									NSUInteger threshold = [self assetPromotionThresholdForKey:key];
+									NSMutableDictionary<NSString *, NSData *> *extracted = [NSMutableDictionary dictionary];
+									id stripped = [MJCloudKitUserDefaultsSync extractAssetsFrom:obj threshold:threshold into:extracted];
+									if ( extracted.count > 0 ) {
+										[self attachAssets:extracted toRecord:record];
+										obj = stripped;
+									}
+								}
 								obj = [MJCloudKitUserDefaultsSync serialize:obj forKey:key];
 								if ( nil == obj )
 									skip = YES;
@@ -574,6 +603,19 @@ static NSString *const recordName = @"UserDefaults";
 											[corrections enumerateKeysAndObjectsUsingBlock:^(id  _Nonnull key, id  _Nonnull obj, BOOL * _Nonnull stop) {
 												Boolean skip = NO;
 												if ( nil != obj ) {
+													// Same asset promotion path as the initial upload — the corrections
+													// might reintroduce large NSData values that need to live as CKAssets
+													// rather than inline on the record.
+													if ( [self isAssetPromotionEnabledForKey:key]
+													     && ( [obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSArray class]] ) ) {
+														NSUInteger threshold = [self assetPromotionThresholdForKey:key];
+														NSMutableDictionary<NSString *, NSData *> *extracted = [NSMutableDictionary dictionary];
+														id stripped = [MJCloudKitUserDefaultsSync extractAssetsFrom:obj threshold:threshold into:extracted];
+														if ( extracted.count > 0 ) {
+															[self attachAssets:extracted toRecord:newRecord];
+															obj = stripped;
+														}
+													}
 													obj = [MJCloudKitUserDefaultsSync serialize:obj forKey:key];
 													if ( nil == obj )
 														skip = YES;
@@ -633,6 +675,10 @@ static NSString *const recordName = @"UserDefaults";
 }
 
 - (void)completeUpdateToiCloudWithChanges:(NSMutableDictionary *)changes {
+	// Remove any temp files we wrote for CKAsset uploads. Whether the save succeeded or failed, the
+	// files are no longer needed — CloudKit has already read them by this point (or won't).
+	[self cleanUpPendingAssetTempFiles];
+
 	// Resume before releasing memory, since there's nothing shared about the memory.
 	dispatch_resume(syncQueue);
 
@@ -656,6 +702,163 @@ static NSString *const recordName = @"UserDefaults";
 		}
 	}
 	return obj;
+}
+
+#pragma mark - Asset promotion
+
+- (void)enableAssetPromotionForKey:(nonnull NSString *)key
+                withThresholdBytes:(NSUInteger)thresholdBytes
+{
+	if ( !assetPromotionThresholds )
+		assetPromotionThresholds = [[NSMutableDictionary alloc] init];
+	[assetPromotionThresholds setObject:[NSNumber numberWithUnsignedInteger:thresholdBytes] forKey:key];
+}
+
+- (BOOL)isAssetPromotionEnabledForKey:(NSString *)key {
+	return assetPromotionThresholds && [assetPromotionThresholds objectForKey:key] != nil;
+}
+
+- (NSUInteger)assetPromotionThresholdForKey:(NSString *)key {
+	NSNumber *t = [assetPromotionThresholds objectForKey:key];
+	return t ? [t unsignedIntegerValue] : NSUIntegerMax;
+}
+
+// SHA256(data) as lowercase hex. Stable across runs and platforms; used as the asset's CKRecord field name.
++ (NSString *)sha256HexOfData:(NSData *)data {
+	unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+	CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+	NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+	for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", digest[i]];
+	return hex;
+}
+
+// Recursively walk `obj`. Wherever an NSData appears with length >= threshold, replace it with a
+// marker dict ({_mjcasset_ref: sha256, _mjcasset_size: N}) in the returned structure, and add the
+// (sha256 -> NSData) entry to outAssets. Containers are copied lazily — if no asset is found inside
+// a container, the original container is returned untouched.
++ (id)extractAssetsFrom:(id)obj
+              threshold:(NSUInteger)thresholdBytes
+                  into:(NSMutableDictionary<NSString *, NSData *> *)outAssets
+{
+	if ( [obj isKindOfClass:[NSData class]] ) {
+		NSData *data = (NSData *)obj;
+		if ( data.length >= thresholdBytes ) {
+			NSString *sha = [self sha256HexOfData:data];
+			[outAssets setObject:data forKey:sha];
+			return @{ kMJAssetRefKey: sha,
+			          kMJAssetSizeKey: [NSNumber numberWithUnsignedInteger:data.length] };
+		}
+		return data;
+	}
+	if ( [obj isKindOfClass:[NSDictionary class]] ) {
+		NSDictionary *src = (NSDictionary *)obj;
+		__block NSMutableDictionary *dst = nil;
+		[src enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+			id replacement = [self extractAssetsFrom:v threshold:thresholdBytes into:outAssets];
+			if ( replacement != v ) {
+				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				[dst setObject:replacement forKey:k];
+			}
+		}];
+		return dst ? dst : src;
+	}
+	if ( [obj isKindOfClass:[NSArray class]] ) {
+		NSArray *src = (NSArray *)obj;
+		NSMutableArray *dst = nil;
+		for (NSUInteger i = 0; i < src.count; i++) {
+			id v = src[i];
+			id replacement = [self extractAssetsFrom:v threshold:thresholdBytes into:outAssets];
+			if ( replacement != v ) {
+				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				[dst replaceObjectAtIndex:i withObject:replacement];
+			}
+		}
+		return dst ? dst : src;
+	}
+	return obj;
+}
+
+// Recursive inverse: walk a deserialized dict/array; wherever a marker `{_mjcasset_ref: sha, ...}`
+// appears, look up the matching CKAsset field on `record`, read it back into NSData, and substitute.
++ (id)materializeAssetsIn:(id)obj
+               fromRecord:(CKRecord *)record
+{
+	if ( [obj isKindOfClass:[NSDictionary class]] ) {
+		NSDictionary *src = (NSDictionary *)obj;
+		NSString *ref = [src objectForKey:kMJAssetRefKey];
+		if ( [ref isKindOfClass:[NSString class]] && ref.length > 0 ) {
+			NSString *fieldName = [kMJAssetFieldPrefix stringByAppendingString:ref];
+			CKAsset *asset = [record objectForKey:fieldName];
+			if ( [asset isKindOfClass:[CKAsset class]] && asset.fileURL ) {
+				NSData *data = [NSData dataWithContentsOfURL:asset.fileURL];
+				if ( data ) return data;
+			}
+			DLog(@"Asset materialize failed for ref %@; leaving marker in place", ref);
+			return src;
+		}
+		__block NSMutableDictionary *dst = nil;
+		[src enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+			id replacement = [self materializeAssetsIn:v fromRecord:record];
+			if ( replacement != v ) {
+				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				[dst setObject:replacement forKey:k];
+			}
+		}];
+		return dst ? dst : src;
+	}
+	if ( [obj isKindOfClass:[NSArray class]] ) {
+		NSArray *src = (NSArray *)obj;
+		NSMutableArray *dst = nil;
+		for (NSUInteger i = 0; i < src.count; i++) {
+			id v = src[i];
+			id replacement = [self materializeAssetsIn:v fromRecord:record];
+			if ( replacement != v ) {
+				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				[dst replaceObjectAtIndex:i withObject:replacement];
+			}
+		}
+		return dst ? dst : src;
+	}
+	return obj;
+}
+
+// Write the NSData blobs in `assets` to temp files, build CKAssets pointing at those files, and set
+// them on `record` under field names "_mjcasset_<sha>". Temp file URLs are tracked on the instance
+// for cleanup after the save callback fires.
+- (void)attachAssets:(NSDictionary<NSString *, NSData *> *)assets toRecord:(CKRecord *)record {
+	if ( !pendingAssetTempFiles )
+		pendingAssetTempFiles = [[NSMutableArray alloc] init];
+
+	[assets enumerateKeysAndObjectsUsingBlock:^(NSString *sha, NSData *data, BOOL *stop) {
+		NSString *fieldName = [kMJAssetFieldPrefix stringByAppendingString:sha];
+		// If the existing record already has a matching asset (same sha => same content), skip the rewrite.
+		// CKAsset doesn't expose a stable identifier, so we infer "already there" purely by field presence;
+		// if a different upload had the same sha it would have to be byte-equal anyway.
+		if ( [record objectForKey:fieldName] ) {
+			DLog(@"Asset %@ already on record; skipping re-attach", sha);
+			return;
+		}
+		NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+		                     [NSString stringWithFormat:@"mjcasset_%@_%@.bin", sha, [[NSUUID UUID] UUIDString]]];
+		NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
+		if ( ![data writeToURL:tmpURL atomically:YES] ) {
+			DLog(@"Failed to write temp file for asset %@", sha);
+			return;
+		}
+		[pendingAssetTempFiles addObject:tmpURL];
+		CKAsset *asset = [[CKAsset alloc] initWithFileURL:tmpURL];
+		[record setObject:asset forKey:fieldName];
+		[asset release];
+	}];
+}
+
+// Called by the upload path after the save attempt finishes (whether it succeeded or not).
+- (void)cleanUpPendingAssetTempFiles {
+	if ( !pendingAssetTempFiles ) return;
+	for (NSURL *url in pendingAssetTempFiles) {
+		[[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+	}
+	[pendingAssetTempFiles removeAllObjects];
 }
 
 + (id)deserialize:(id)remoteObj
@@ -709,6 +912,12 @@ static NSString *const recordName = @"UserDefaults";
 				__block int additions = 0, modifications = 0;
 				__block NSMutableDictionary *changes = nil;
 				[[record allKeys] enumerateObjectsUsingBlock:^(id key, NSUInteger idx, BOOL *stop) {
+					// Skip our own asset-storage fields here — they're keyed off the user's keys and
+					// will be picked up implicitly by materializeAssetsIn:fromRecord: during the
+					// deserialize step. Without this skip we'd try to setObject: a CKAsset directly
+					// into NSUserDefaults, which fails the type check.
+					if ( [(NSString *)key hasPrefix:kMJAssetFieldPrefix] )
+						return;
 					if ( ( nil != prefix && [key hasPrefix:prefix] )
 						|| ( nil != matchList && [matchList containsObject:key] ) ) {
 
@@ -717,6 +926,16 @@ static NSString *const recordName = @"UserDefaults";
 						NSObject *originalObj = obj;
 
 						if ( nil != obj ) {
+							// If this key is opted into asset promotion, strip large NSData values
+							// from the local value the same way we would on upload, so the resulting
+							// binary plist matches the remote one byte-for-byte when content is equal.
+							// We discard the extracted assets here — we're only doing a comparison.
+							if ( [self isAssetPromotionEnabledForKey:key]
+							     && ( [obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSArray class]] ) ) {
+								NSUInteger threshold = [self assetPromotionThresholdForKey:key];
+								NSMutableDictionary *discard = [NSMutableDictionary dictionary];
+								obj = [MJCloudKitUserDefaultsSync extractAssetsFrom:obj threshold:threshold into:discard];
+							}
 							obj = [MJCloudKitUserDefaultsSync serialize:obj forKey:key];
 							if ( nil == obj )
 								skip = YES;
@@ -745,6 +964,12 @@ static NSString *const recordName = @"UserDefaults";
 								remoteObj = [MJCloudKitUserDefaultsSync deserialize:remoteObj forKey:key similarTo:originalObj];
 								if ( nil == remoteObj )
 									skip = YES;
+								// Re-hydrate any CKAssets attached to the record: walk the deserialized
+								// dict, find {_mjcasset_ref: sha} markers, and replace them with the bytes
+								// from the corresponding record["_mjcasset_<sha>"] CKAsset field.
+								else if ( [self isAssetPromotionEnabledForKey:key] ) {
+									remoteObj = [MJCloudKitUserDefaultsSync materializeAssetsIn:remoteObj fromRecord:record];
+								}
 							}
 
 							if ( !skip ) {

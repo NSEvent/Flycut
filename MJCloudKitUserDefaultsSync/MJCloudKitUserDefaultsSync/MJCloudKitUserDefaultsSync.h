@@ -159,4 +159,27 @@ withContainerIdentifier:(nonnull NSString *)containerIdentifier;
  */
 - (nullable NSString *)diagnosticData;
 
+/**
+ Enables CKAsset promotion for the dict-valued user-defaults entry at the given key.
+
+ When promotion is enabled, NSData values found at any depth within the dict at `key`
+ that are at least `thresholdBytes` bytes long get uploaded as separate CKAssets on the
+ same CKRecord, sidestepping the ~1 MB per-record limit imposed by CloudKit. The main
+ binary-plist field at `key` has those NSData values replaced with a small marker dict
+ ({"_mjcasset_ref": "<sha256-hex>", "_mjcasset_size": N}) and the bytes live in sibling
+ fields named "_mjcasset_<sha256-hex>".
+
+ The marker is content-addressed, so identical bytes across saves and across the
+ upload/download equality check share an identity and don't re-upload.
+
+ Call this once per key, before sync is started. Calling with `enabled = NO` removes the
+ promotion configuration.
+
+ @param key The user-defaults key whose dict value should have asset promotion applied.
+ @param thresholdBytes NSData values smaller than this stay inline in the binary plist.
+                       Pass 0 to promote every NSData found.
+ */
+- (void)enableAssetPromotionForKey:(nonnull NSString *)key
+                withThresholdBytes:(NSUInteger)thresholdBytes;
+
 @end

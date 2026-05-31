@@ -58,7 +58,9 @@
         @"syncClippingsViaICloud",
 		[NSNumber numberWithBool:YES],
 		@"captureImages",
-		[NSNumber numberWithInt:1024],
+		// Raised from 1024 KB after switching to CKAsset promotion for sync. Cap is now about
+		// keeping NSUserDefaults size sane, not about fitting under CloudKit's per-record limit.
+		[NSNumber numberWithInt:10240],
 		@"maxImageClippingKB",
         nil]];
 
@@ -700,6 +702,14 @@
 		[[MJCloudKitUserDefaultsSync sharedSync] removeNotificationsFor:MJSyncNotificationSaveSuccess forTarget:self];
 		[[MJCloudKitUserDefaultsSync sharedSync] addNotificationFor:MJSyncNotificationSaveSuccess withSelector:@selector(checkPreferencesSaveSuccess:) withTarget: self];
 
+		// Image clippings inside the "store" dict hold raw NSData (PNG/TIFF bytes). Without promotion,
+		// they'd inflate the single CKRecord past the 1 MB hard limit and break sync entirely. With
+		// promotion, anything 4 KB or larger gets uploaded as a separate CKAsset so the main record
+		// stays small. 4 KB is low enough to catch every realistic screenshot and high enough that
+		// stray small-NSData values elsewhere (e.g. obscure pref blobs) stay inline.
+		[[MJCloudKitUserDefaultsSync sharedSync] enableAssetPromotionForKey:@"store"
+		                                                 withThresholdBytes:4096];
+
 		[[MJCloudKitUserDefaultsSync sharedSync] startWithKeyMatchList:@[@"store"]
 								  withContainerIdentifier:kiCloudId];
 	}
@@ -1038,20 +1048,27 @@
 		NSRange loadRange = NSMakeRange(0, rangeCap);
 		NSArray *toBeRestoredClips = [[[savedJCList subarrayWithRange:loadRange] reverseObjectEnumerator] allObjects];
 		for( NSDictionary *aSavedClipping in toBeRestoredClips) {
-			NSString *imageB64 = [aSavedClipping objectForKey:@"ImageData"];
-			if ( [imageB64 isKindOfClass:[NSString class]] && [imageB64 length] > 0 ) {
-				NSData *imgData = [[[NSData alloc] initWithBase64EncodedString:imageB64 options:NSDataBase64DecodingIgnoreUnknownCharacters] autorelease];
-				if ( imgData && [imgData length] > 0 ) {
-					FlycutClipping *imageClip = [[FlycutClipping alloc] initWithImageData:imgData
-																				 withType:[aSavedClipping objectForKey:@"Type"]
-																		withDisplayLength:[store displayLen]
-																	 withAppLocalizedName:[aSavedClipping objectForKey:@"AppLocalizedName"]
-																		 withAppBundleURL:[aSavedClipping objectForKey:@"AppBundleURL"]
-																			withTimestamp:[[aSavedClipping objectForKey:@"Timestamp"] integerValue]];
-					[store addClipping:imageClip];
-					[imageClip release];
-					continue;
-				}
+			id imageEntry = [aSavedClipping objectForKey:@"ImageData"];
+			NSData *imgData = nil;
+			if ( [imageEntry isKindOfClass:[NSData class]] ) {
+				// Current format: raw NSData (post-CKAsset rework).
+				imgData = (NSData *)imageEntry;
+			}
+			else if ( [imageEntry isKindOfClass:[NSString class]] && [(NSString *)imageEntry length] > 0 ) {
+				// Legacy format from pre-CKAsset builds: base64-encoded string. Decode and accept so existing
+				// local stores load cleanly after upgrade.
+				imgData = [[[NSData alloc] initWithBase64EncodedString:(NSString *)imageEntry options:NSDataBase64DecodingIgnoreUnknownCharacters] autorelease];
+			}
+			if ( imgData && [imgData length] > 0 ) {
+				FlycutClipping *imageClip = [[FlycutClipping alloc] initWithImageData:imgData
+																			 withType:[aSavedClipping objectForKey:@"Type"]
+																	withDisplayLength:[store displayLen]
+																 withAppLocalizedName:[aSavedClipping objectForKey:@"AppLocalizedName"]
+																	 withAppBundleURL:[aSavedClipping objectForKey:@"AppBundleURL"]
+																		withTimestamp:[[aSavedClipping objectForKey:@"Timestamp"] integerValue]];
+				[store addClipping:imageClip];
+				[imageClip release];
+				continue;
 			}
 			[store addClipping:[aSavedClipping objectForKey:@"Contents"]
 							  ofType:[aSavedClipping objectForKey:@"Type"]
@@ -1151,13 +1168,14 @@
         if ( timestamp > 0 )
             [dict setObject:[NSNumber numberWithInt:timestamp] forKey:@"Timestamp"];
 
-        // Image clippings: persist the raw bytes base64-encoded under "ImageData". Kept in the same
-        // dict so they ride along through MJCloudKitUserDefaultsSync to other devices.
+        // Image clippings: persist the raw bytes as NSData under "ImageData". NSUserDefaults handles
+        // NSData inside nested dicts via property-list encoding, and the CKAsset promotion layer in
+        // MJCloudKitUserDefaultsSync recognizes NSData values and uploads them as separate CKAssets
+        // instead of inlining them into the 1 MB-capped main record.
         if ( [clipping isImage] ) {
             NSData *imgData = [clipping imageData];
-            NSString *b64 = [imgData base64EncodedStringWithOptions:0];
-            if ( b64 )
-                [dict setObject:b64 forKey:@"ImageData"];
+            if ( imgData )
+                [dict setObject:imgData forKey:@"ImageData"];
         }
 
         [jcListArray addObject:dict];

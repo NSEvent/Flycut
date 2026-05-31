@@ -50,6 +50,7 @@
 // Basic functionality
 -(int)indexOfClipping:(NSString*)contents ofType:(NSString*)type fromApp:(NSString *)appName withAppBundleURL:(NSString *)bundleURL;
 -(bool)addClipping:(NSString*)contents ofType:(NSString*)type fromApp:(NSString *)appName withAppBundleURL:(NSString *)bundleURL target:(id)selectorTarget clippingAddedSelector:(SEL)clippingAddedSelectorclippingAddedSelector;
+-(bool)addImageClipping:(NSData*)imageData ofType:(NSString*)type fromApp:(NSString *)appName withAppBundleURL:(NSString *)bundleURL target:(id)selectorTarget clippingAddedSelector:(SEL)clippingAddedSelector;
 -(int)stackPosition;
 -(NSString*)getPasteFromStackPosition;
 -(NSString*)getPasteFromIndex:(int) position;
@@ -98,6 +99,8 @@
 -(int)jcListCount;
 -(int)rememberNum;
 -(FlycutClipping*)clippingAtStackPosition;
+-(FlycutClipping*)clippingAtIndex:(int)index;
+-(void)moveClippingToTopAtIndex:(int)index;
 -(NSArray *) previousDisplayStrings:(int)howMany containing:(NSString*)search;
 -(NSArray *) previousIndexes:(int)howMany containing:(NSString*)search; // This method is in newest-first order.
 -(void)setDisableStoreTo:(bool) value;

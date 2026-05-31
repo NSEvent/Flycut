@@ -749,9 +749,7 @@
 
 - (void)pasteFromStack
 {
-	NSString *content = [flycutOperator getPasteFromStackPosition];
-	if ( nil != content ) {
-		[self addClipToPasteboard:content];
+	if ( [self pasteClippingAtIndex:[flycutOperator stackPosition]] ) {
 		[self performSelector:@selector(hideApp) withObject:nil afterDelay:0.2];
 		[self performSelector:@selector(fakeCommandV) withObject:nil afterDelay:0.2];
 	} else {
@@ -779,10 +777,8 @@
         position = [mapping[position] intValue];
     }
 
-    NSString *content = [flycutOperator getPasteFromIndex: position];
-    if ( nil != content )
+    if ( [self pasteClippingAtIndex:position] )
     {
-        [self addClipToPasteboard:content];
         [self updateMenu];
 	}
 }
@@ -866,6 +862,16 @@
 -(void)pollPB:(NSTimer *)timer
 {
     NSString *type = [jcPasteboard availableTypeFromArray:[NSArray arrayWithObject:NSStringPboardType]];
+
+    // Image detection: only kick in when there's no string content on the pasteboard. Most copies that
+    // include both (e.g. Preview "Copy" of a selection) prefer the text representation; pure image copies
+    // (screenshots, Photos drag, Figma export) have no NSStringPboardType.
+    BOOL captureImages = [[NSUserDefaults standardUserDefaults] boolForKey:@"captureImages"];
+    NSString *imageType = nil;
+    if ( captureImages && type == nil ) {
+        imageType = [jcPasteboard availableTypeFromArray:@[NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
+    }
+
     if ( [pbCount intValue] != [jcPasteboard changeCount] && ![flycutOperator storeDisabled] ) {
         // Reload pbCount with the current changeCount
         // Probably poor coding technique, but pollPB should be the only thing messing with pbCount, so it should be okay
@@ -899,7 +905,36 @@
                    [flycutOperator addClipping:contents ofType:type fromApp:[currRunningApp localizedName] withAppBundleURL:currRunningApp.bundleURL.path target:self clippingAddedSelector:@selector(updateMenu)];
                }
             });
-        } 
+        } else if ( imageType != nil ) {
+            NSRunningApplication *currRunningApp = nil;
+            for (NSRunningApplication *currApp in [[NSWorkspace sharedWorkspace] runningApplications])
+                if ([currApp isActive])
+                    currRunningApp = currApp;
+
+            dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+            dispatch_async(queue, ^{
+                NSData *imageData = [jcPasteboard dataForType:imageType];
+                if ( imageData == nil || [imageData length] == 0 ) {
+                    DLog(@"Image: Empty");
+                    return;
+                }
+
+                NSInteger maxKB = [[NSUserDefaults standardUserDefaults] integerForKey:@"maxImageClippingKB"];
+                if ( maxKB > 0 && [imageData length] > (NSUInteger)(maxKB * 1024) ) {
+                    DLog(@"Image skipped: %lu bytes exceeds %ld KB limit", (unsigned long)[imageData length], (long)maxKB);
+                    return;
+                }
+
+                if ( ! [pbCount isEqualTo:pbBlockCount] ) {
+                    [flycutOperator addImageClipping:imageData
+                                              ofType:imageType
+                                             fromApp:[currRunningApp localizedName]
+                                    withAppBundleURL:currRunningApp.bundleURL.path
+                                              target:self
+                               clippingAddedSelector:@selector(updateMenu)];
+                }
+            });
+        }
     }
 }
 
@@ -1286,11 +1321,21 @@ didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
 	dispatch_sync(menuQueue, ^{
 		[jcMenu setMenuChangedMessagesEnabled:NO];
 
-		NSArray *returnedDisplayStrings = [flycutOperator previousDisplayStrings:[[NSUserDefaults standardUserDefaults] integerForKey:@"displayNum"] containing:search];
+		NSInteger howMany = [[NSUserDefaults standardUserDefaults] integerForKey:@"displayNum"];
+		NSArray *returnedDisplayStrings = [flycutOperator previousDisplayStrings:howMany containing:search];
+		// Parallel array of clipping-store indexes for the same items, used to look up images.
+		NSArray *returnedIndexes = [flycutOperator previousIndexes:howMany containing:search];
 
 		NSArray *menuItems = [[[jcMenu itemArray] reverseObjectEnumerator] allObjects];
 
 		NSArray *clipStrings = [[returnedDisplayStrings reverseObjectEnumerator] allObjects];
+		NSArray *clipIndexes = [[returnedIndexes reverseObjectEnumerator] allObjects];
+		// previousIndexes: doesn't cap against jcListCount for the no-search path, while previousDisplayStrings: does.
+		// Trim clipIndexes to match clipStrings — keep the tail (oldest→newest) so the parallel-array alignment holds.
+		if ( [clipIndexes count] > [clipStrings count] ) {
+			NSRange tail = NSMakeRange([clipIndexes count] - [clipStrings count], [clipStrings count]);
+			clipIndexes = [clipIndexes subarrayWithRange:tail];
+		}
 
 		// Figure out if the number of menu items is changing and add or remove entries as necessary.
 		// If we remove all of them and add all new ones, the menu won't redraw if the count is unchanged, so just reuse them by changing their title.
@@ -1318,12 +1363,32 @@ didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
 			}
 		}
 
-		// Now set the correct titles for each menu item.
+		// Now set the correct titles + thumbnails for each menu item.
+		int titleIdx = 0;
 		for(NSString *pbMenuTitle in clipStrings) {
 			newItems--;
 			NSMenuItem *item = [jcMenu itemAtIndex:newItems];
 			[item setTitle:pbMenuTitle];
+
+			// If this slot maps to an image clipping, decode a small thumbnail and stick it on the
+			// menu item. Otherwise clear any previous image (slots are reused across updates).
+			NSImage *thumb = nil;
+			if ( titleIdx < (int)[clipIndexes count] ) {
+				int storeIdx = [clipIndexes[titleIdx] intValue];
+				FlycutClipping *clip = [flycutOperator clippingAtIndex:storeIdx];
+				if ( clip && [clip isImage] ) {
+					thumb = [[NSImage alloc] initWithData:[clip imageData]];
+					if ( thumb ) {
+						[thumb setSize:NSMakeSize(16, 16)];
+						[item setImage:thumb];
+						[thumb release];
+					}
+				}
+			}
+			if ( !thumb ) [item setImage:nil];
+
 			[jcMenu itemChanged: item];
+			titleIdx++;
 		}
 	});
 }
@@ -1350,11 +1415,43 @@ didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
 {
     NSArray *pbTypes;
     pbTypes = [NSArray arrayWithObjects:@"NSStringPboardType",NULL];
-    
+
     [jcPasteboard declareTypes:pbTypes owner:NULL];
-	
+
     [jcPasteboard setString:pbFullText forType:@"NSStringPboardType"];
     [self setPBBlockCount:[NSNumber numberWithInt:[jcPasteboard changeCount]]];
+}
+
+-(void)addImageClipToPasteboard:(NSData*)imageData ofType:(NSString*)type
+{
+    NSString *boardType = type;
+    if ( boardType == nil || [boardType length] == 0 )
+        boardType = NSPasteboardTypePNG;
+
+    [jcPasteboard declareTypes:@[boardType] owner:nil];
+    [jcPasteboard setData:imageData forType:boardType];
+    [self setPBBlockCount:[NSNumber numberWithInt:[jcPasteboard changeCount]]];
+}
+
+// Sends the clipping at `position` back to the pasteboard, branching on text vs. image. Returns YES if
+// something was placed on the pasteboard.
+-(BOOL)pasteClippingAtIndex:(int)position
+{
+    FlycutClipping *clipping = [flycutOperator clippingAtIndex:position];
+    if ( clipping == nil ) return NO;
+
+    if ( [clipping isImage] ) {
+        [self addImageClipToPasteboard:[clipping imageData] ofType:[clipping type]];
+        // Mirror the pasteMovesToTop behavior baked into getPasteFromIndex: for text clippings.
+        if ( [[NSUserDefaults standardUserDefaults] boolForKey:@"pasteMovesToTop"] )
+            [flycutOperator moveClippingToTopAtIndex:position];
+        return YES;
+    }
+
+    NSString *content = [flycutOperator getPasteFromIndex:position];
+    if ( content == nil ) return NO;
+    [self addClipToPasteboard:content];
+    return YES;
 }
 
 -(void) stackDown
@@ -1367,7 +1464,16 @@ didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
 -(void) fillBezel
 {
     FlycutClipping* clipping = [flycutOperator clippingAtStackPosition];
-    [bezel setText:[NSString stringWithFormat:@"%@", [clipping contents]]];
+    if ( [clipping isImage] ) {
+        // setText: clears any prior image overlay, so set the text first (the placeholder backs the
+        // image in case decoding fails), then overlay the image on top.
+        [bezel setText:[clipping displayString]];
+        NSImage *preview = [[NSImage alloc] initWithData:[clipping imageData]];
+        [bezel setClippingImage:preview];
+        [preview release];
+    } else {
+        [bezel setText:[NSString stringWithFormat:@"%@", [clipping contents]]];
+    }
     [bezel setCharString:[NSString stringWithFormat:@"%d of %d", [flycutOperator stackPosition] + 1, [flycutOperator jcListCount]]];
     NSString *localizedName = [clipping appLocalizedName];
     if ( nil == localizedName )

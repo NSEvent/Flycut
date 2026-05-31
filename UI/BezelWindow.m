@@ -234,6 +234,31 @@ static const float lineHeight = 16;
 	[bezelText release];
 	bezelText = newText;
 	[textField.textField setStringValue:bezelText];
+	// Switching to a text clipping — drop any image overlay from a prior image clipping.
+	[self setClippingImage:nil];
+}
+
+- (void)setClippingImage:(NSImage *)newImage
+{
+	if ( newImage == nil ) {
+		if ( clippingImageView != nil ) {
+			[clippingImageView removeFromSuperview];
+			[clippingImageView release];
+			clippingImageView = nil;
+			[textField setHidden:NO];
+		}
+		return;
+	}
+
+	if ( clippingImageView == nil ) {
+		clippingImageView = [[NSImageView alloc] initWithFrame:[self textFrame]];
+		[clippingImageView setImageScaling:NSImageScaleProportionallyUpOrDown];
+		[clippingImageView setImageAlignment:NSImageAlignCenter];
+		[[self contentView] addSubview:clippingImageView];
+	}
+	[clippingImageView setFrame:[self textFrame]];
+	[clippingImageView setImage:newImage];
+	[textField setHidden:YES];
 }
 
 - (void)setSourceIcon:(NSImage *)newSourceIcon

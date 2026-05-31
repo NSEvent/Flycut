@@ -56,6 +56,10 @@
         @"syncSettingsViaICloud",
         [NSNumber numberWithBool:NO],
         @"syncClippingsViaICloud",
+		[NSNumber numberWithBool:YES],
+		@"captureImages",
+		[NSNumber numberWithInt:1024],
+		@"maxImageClippingKB",
         nil]];
 
 	settingsSyncList = @[@"rememberNum",
@@ -67,7 +71,9 @@
 						 @"skipPasswordLengths",
 						 @"skipPasswordLengthsList",
 						 @"removeDuplicates",
-						 @"pasteMovesToTop"];
+						 @"pasteMovesToTop",
+						 @"captureImages",
+						 @"maxImageClippingKB"];
 	[settingsSyncList retain];
 
 	return self;
@@ -497,6 +503,32 @@
 		return success;
     }
 	return  NO;
+}
+
+-(bool)addImageClipping:(NSData*)imageData ofType:(NSString*)type fromApp:(NSString *)appName withAppBundleURL:(NSString *)bundleURL target:(id)selectorTarget clippingAddedSelector:(SEL)clippingAddedSelector
+{
+	if ( [imageData length] == 0 )
+		return NO;
+
+	// Skip exact-byte duplicates at the top of the stack — matches the text-clipping behavior above.
+	FlycutClipping *top = [clippingStore jcListCount] > 0 ? [clippingStore clippingAtPosition:0] : nil;
+	if ( top && [top isImage] && [[top imageData] isEqualToData:imageData] )
+		return NO;
+
+	FlycutClipping *newClipping = [[FlycutClipping alloc] initWithImageData:imageData
+																   withType:type
+														  withDisplayLength:[clippingStore displayLen]
+													   withAppLocalizedName:appName
+														   withAppBundleURL:bundleURL
+															  withTimestamp:[[NSDate date] timeIntervalSince1970]];
+	[clippingStore addClipping:newClipping];
+	[newClipping release];
+
+	stackPosition = 0;
+	[selectorTarget performSelector:clippingAddedSelector];
+	[self actionAfterListModification];
+
+	return YES;
 }
 
 - (void)willDeleteClippingFromStore:(id)store AtIndex:(int)index {
@@ -1005,12 +1037,28 @@
 		int rangeCap = [savedJCList count] < [store rememberNum] ? [savedJCList count] : [store rememberNum];
 		NSRange loadRange = NSMakeRange(0, rangeCap);
 		NSArray *toBeRestoredClips = [[[savedJCList subarrayWithRange:loadRange] reverseObjectEnumerator] allObjects];
-		for( NSDictionary *aSavedClipping in toBeRestoredClips)
+		for( NSDictionary *aSavedClipping in toBeRestoredClips) {
+			NSString *imageB64 = [aSavedClipping objectForKey:@"ImageData"];
+			if ( [imageB64 isKindOfClass:[NSString class]] && [imageB64 length] > 0 ) {
+				NSData *imgData = [[[NSData alloc] initWithBase64EncodedString:imageB64 options:NSDataBase64DecodingIgnoreUnknownCharacters] autorelease];
+				if ( imgData && [imgData length] > 0 ) {
+					FlycutClipping *imageClip = [[FlycutClipping alloc] initWithImageData:imgData
+																				 withType:[aSavedClipping objectForKey:@"Type"]
+																		withDisplayLength:[store displayLen]
+																	 withAppLocalizedName:[aSavedClipping objectForKey:@"AppLocalizedName"]
+																		 withAppBundleURL:[aSavedClipping objectForKey:@"AppBundleURL"]
+																			withTimestamp:[[aSavedClipping objectForKey:@"Timestamp"] integerValue]];
+					[store addClipping:imageClip];
+					[imageClip release];
+					continue;
+				}
+			}
 			[store addClipping:[aSavedClipping objectForKey:@"Contents"]
 							  ofType:[aSavedClipping objectForKey:@"Type"]
 				fromAppLocalizedName:[aSavedClipping objectForKey:@"AppLocalizedName"]
 					fromAppBundleURL:[aSavedClipping objectForKey:@"AppBundleURL"]
 						 atTimestamp:[[aSavedClipping objectForKey:@"Timestamp"] integerValue]];
+		}
 		return YES;
 	} else DLog(@"Not array");
 	return NO;
@@ -1069,6 +1117,18 @@
     return [clippingStore clippingAtPosition:stackPosition];
 }
 
+-(FlycutClipping*)clippingAtIndex:(int)index
+{
+    return [clippingStore clippingAtPosition:index];
+}
+
+-(void)moveClippingToTopAtIndex:(int)index
+{
+    [clippingStore clippingMoveToTop:index];
+    stackPosition = 0;
+    [self actionAfterListModification];
+}
+
 - (void)saveStore:(FlycutStore *)store toKey:(NSString *)key onDict:(NSMutableDictionary *)saveDict {
     NSMutableArray *jcListArray = [NSMutableArray array];
     for ( int i = 0 ; i < [store jcListCount] ; i++ )
@@ -1090,6 +1150,15 @@
         int timestamp = [clipping timestamp];
         if ( timestamp > 0 )
             [dict setObject:[NSNumber numberWithInt:timestamp] forKey:@"Timestamp"];
+
+        // Image clippings: persist the raw bytes base64-encoded under "ImageData". Kept in the same
+        // dict so they ride along through MJCloudKitUserDefaultsSync to other devices.
+        if ( [clipping isImage] ) {
+            NSData *imgData = [clipping imageData];
+            NSString *b64 = [imgData base64EncodedStringWithOptions:0];
+            if ( b64 )
+                [dict setObject:b64 forKey:@"ImageData"];
+        }
 
         [jcListArray addObject:dict];
     }

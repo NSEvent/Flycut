@@ -11,6 +11,15 @@
 
 
 #import "FlycutClipping.h"
+#if TARGET_OS_OSX
+#import <AppKit/AppKit.h>
+#else
+#import <UIKit/UIKit.h>
+#endif
+
+@interface FlycutClipping ()
+-(NSString *) imagePlaceholderString;
+@end
 
 @implementation FlycutClipping
 
@@ -31,6 +40,7 @@
     clipContents = [[[NSString alloc] init] retain];
     clipDisplayString = [[[NSString alloc] init] retain];
     clipType = [[[NSString alloc] init] retain];
+    clipImageData = nil;
 
     [self setContents:contents setDisplayLength:displayLength];
     [self setType:type];
@@ -38,7 +48,32 @@
     [self setAppBundleURL:bundleURL];
     [self setTimestamp:timestamp];
     [self setHasName:false];
-    
+
+    return self;
+}
+
+-(id) initWithImageData:(NSData *)imageData withType:(NSString *)type withDisplayLength:(int)displayLength withAppLocalizedName:(NSString *)localizedName withAppBundleURL:(NSString *)bundleURL withTimestamp:(NSInteger)timestamp
+{
+    [super init];
+    clipContents = [[[NSString alloc] init] retain];
+    clipDisplayString = [[[NSString alloc] init] retain];
+    clipType = [[[NSString alloc] init] retain];
+    clipImageData = nil;
+
+    [self setType:type];
+    [self setImageData:imageData];
+    if ( displayLength > 0 ) {
+        clipDisplayLength = displayLength;
+    }
+    [self resetDisplayString]; // build placeholder string from image metadata
+    // Mirror the placeholder text into clipContents so search and the legacy "Contents" field have something
+    // to match against.
+    [self setContents:clipDisplayString];
+    [self setAppLocalizedName:localizedName];
+    [self setAppBundleURL:bundleURL];
+    [self setTimestamp:timestamp];
+    [self setHasName:false];
+
     return self;
 }
 
@@ -134,6 +169,14 @@
         clipHasName = newHasName;
 }
 
+-(void) setImageData:(NSData *)newImageData
+{
+    id old = clipImageData;
+    [newImageData retain];
+    clipImageData = newImageData;
+    [old release];
+}
+
 -(void) resetDisplayString
 {
     NSString *newDisplayString, *firstLineOfClipping, *trimmedString;
@@ -142,18 +185,61 @@
 	NSRange contentsRange;
 	// We're resetting the display string, so release the old one.
     [clipDisplayString release];
+
+    // Image clippings get a synthesized "[Image WxH KB]" placeholder, which both flows through
+    // the existing menu/bezel rendering and makes them grep-able in the search box.
+    if ( clipImageData != nil ) {
+        NSString *placeholder = [self imagePlaceholderString];
+        [placeholder retain];
+        clipDisplayString = placeholder;
+        return;
+    }
+
 	// We want to restrict the display string to the clipping contents through the first line break.
     trimmedString = [clipContents stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     [trimmedString getLineStart:&start end:&lineEnd contentsEnd:&contentsEnd forRange:startRange];
 	contentsRange = NSMakeRange(0, contentsEnd);
 	firstLineOfClipping = [trimmedString substringWithRange:contentsRange];
     if ( [firstLineOfClipping length] > clipDisplayLength ) {
-        newDisplayString = [[NSString stringWithString:[firstLineOfClipping substringToIndex:clipDisplayLength]] stringByAppendingString:@"…"];   
+        newDisplayString = [[NSString stringWithString:[firstLineOfClipping substringToIndex:clipDisplayLength]] stringByAppendingString:@"…"];
     } else {
         newDisplayString = [NSString stringWithString:firstLineOfClipping];
     }
     [newDisplayString retain];
     clipDisplayString = newDisplayString;
+}
+
+-(NSString *) imagePlaceholderString
+{
+    NSUInteger byteCount = [clipImageData length];
+    NSString *sizeLabel;
+    if ( byteCount < 1024 ) sizeLabel = [NSString stringWithFormat:@"%lu B", (unsigned long)byteCount];
+    else if ( byteCount < 1024 * 1024 ) sizeLabel = [NSString stringWithFormat:@"%.0f KB", byteCount / 1024.0];
+    else sizeLabel = [NSString stringWithFormat:@"%.1f MB", byteCount / (1024.0 * 1024.0)];
+
+    NSString *typeLabel = @"Image";
+    if ( [clipType isEqualToString:@"public.png"] || [clipType isEqualToString:@"NSPasteboardTypePNG"] ) typeLabel = @"PNG";
+    else if ( [clipType isEqualToString:@"public.tiff"] || [clipType isEqualToString:@"NSPasteboardTypeTIFF"] ) typeLabel = @"TIFF";
+    else if ( [clipType isEqualToString:@"public.jpeg"] ) typeLabel = @"JPEG";
+
+    CGSize pixelSize = CGSizeZero;
+#if TARGET_OS_OSX
+    NSImage *probe = [[NSImage alloc] initWithData:clipImageData];
+    if ( probe ) {
+        pixelSize = probe.size;
+        [probe release];
+    }
+#else
+    UIImage *probe = [[UIImage alloc] initWithData:clipImageData];
+    if ( probe ) {
+        pixelSize = probe.size;
+        [probe release];
+    }
+#endif
+
+    if ( pixelSize.width > 0 && pixelSize.height > 0 )
+        return [NSString stringWithFormat:@"[%@ %.0fx%.0f, %@]", typeLabel, pixelSize.width, pixelSize.height, sizeLabel];
+    return [NSString stringWithFormat:@"[%@ image, %@]", typeLabel, sizeLabel];
 }
 
 -(NSString *) description
@@ -216,12 +302,27 @@
     return clipHasName;
 }
 
+-(NSData *) imageData
+{
+    return clipImageData;
+}
+
+-(BOOL) isImage
+{
+    return clipImageData != nil;
+}
+
 - (BOOL)isEqual:(id)other {
     if (other == self)
         return YES;
     if (!other || ![other isKindOfClass:[self class]])
         return NO;
     FlycutClipping * otherClip = (FlycutClipping *)other;
+    // Two image clippings match when their raw bytes match. Mixed image/text never matches.
+    if ( clipImageData != nil || otherClip->clipImageData != nil ) {
+        if ( clipImageData == nil || otherClip->clipImageData == nil ) return NO;
+        return [clipImageData isEqualToData:otherClip->clipImageData];
+    }
     return (/*[self.type isEqualToString:otherClip.type] &&*/ // Type is under-utilized a this time and will mismatch on cross-device (macOS <-> iOS) usage.  This should be revisited once we have support for more than just raw text clippings.
             [self.contents isEqualToString:otherClip.contents]);
 }
@@ -234,6 +335,7 @@
     [clipType release];
     [appLocalizedName release];
     [appBundleURL release];
+    [clipImageData release];
     clipDisplayLength = 0;
     [clipDisplayString release];
     clipHasName = 0;

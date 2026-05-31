@@ -13,7 +13,7 @@
 
 @interface FlycutClipping : NSObject {
 // What must a clipping hold?
-// The text
+// The text (also the placeholder display string for image clippings)
     NSString * clipContents;
 // The text type
     NSString * clipType;
@@ -29,9 +29,12 @@
     NSString * appBundleURL;
 // The time
     NSInteger clipTimestamp;
+// Optional raw image bytes (PNG/TIFF) for image clippings; nil for text clippings.
+    NSData * clipImageData;
 }
 
 -(id) initWithContents:(NSString *)contents withType:(NSString *)type withDisplayLength:(int)displayLength withAppLocalizedName:(NSString *)localizedName withAppBundleURL:(NSString *)bundleURL withTimestamp:(NSInteger)timestamp;
+-(id) initWithImageData:(NSData *)imageData withType:(NSString *)type withDisplayLength:(int)displayLength withAppLocalizedName:(NSString *)localizedName withAppBundleURL:(NSString *)bundleURL withTimestamp:(NSInteger)timestamp;
 /* -(id) initWithCoder:(NSCoder *)coder;
 -(void) decodeWithCoder:(NSCoder *)coder; */
 -(NSString *) description;
@@ -42,6 +45,7 @@
 -(void) setType:(NSString *)newType;
 -(void) setDisplayLength:(int)newDisplayLength;
 -(void) setHasName:(BOOL)newHasName;
+-(void) setImageData:(NSData *)newImageData;
 
 // Retrieve values
 -(FlycutClipping *) clipping;
@@ -53,6 +57,8 @@
 -(NSString *) appBundleURL;
 -(NSInteger) timestamp;
 -(BOOL) hasName;
+-(NSData *) imageData;
+-(BOOL) isImage;
 
 // Additional functions
 -(void) resetDisplayString;

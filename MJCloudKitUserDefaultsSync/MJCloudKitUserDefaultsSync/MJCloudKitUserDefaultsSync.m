@@ -384,6 +384,10 @@ static NSString *const kMJAssetFieldPrefix = @"mj_asset_";
 		// Flow controls.
 		refuseUpdateToICloudUntilAfterUpdateFromICloud = NO;
 		oneTimeDeleteZoneFromICloud = NO; // To clear the user's sync data from iCloud for testing first-time scenario.
+		if ( getenv("MJ_WIPE_ICLOUD_ZONE") ) {
+			NSLog(@"MJ_WIPE_ICLOUD_ZONE set — will delete CloudKit record zone on startup.");
+			oneTimeDeleteZoneFromICloud = YES;
+		}
 
 		// Status flags and state.
 		alreadyPolling = NO;
@@ -591,6 +595,14 @@ static NSString *const kMJAssetFieldPrefix = @"mj_asset_";
 													// Failed to deserialize.  Put our value in.
 													fromObj = originalObj;
 												}
+												// Also materialize CKAssets back to NSData so the conflict consumer
+												// sees real bytes instead of marker dicts. Without this, the consumer
+												// (e.g. Flycut's loadEngineFrom:) doesn't recognize marker dicts as
+												// image data and degrades the clipping to text-only — which then
+												// gets re-uploaded as the conflict resolution, corrupting the record.
+												if ( [self isAssetPromotionEnabledForKey:key] ) {
+													fromObj = [MJCloudKitUserDefaultsSync materializeAssetsIn:fromObj fromRecord:newRecord];
+												}
 											}
 											id remoteObj = [newRecord objectForKey:key];
 											if ( nil != remoteObj ) {
@@ -598,6 +610,9 @@ static NSString *const kMJAssetFieldPrefix = @"mj_asset_";
 												if ( nil == remoteObj ) {
 													// Failed to deserialize.  Put our value in.
 													remoteObj = [obj lastObject];
+												}
+												if ( [self isAssetPromotionEnabledForKey:key] ) {
+													remoteObj = [MJCloudKitUserDefaultsSync materializeAssetsIn:remoteObj fromRecord:newRecord];
 												}
 											}
 
@@ -1020,14 +1035,68 @@ static NSString *const kMJAssetFieldPrefix = @"mj_asset_";
 								// Re-hydrate any CKAssets attached to the record: walk the deserialized
 								// dict, find {_mjcasset_ref: sha} markers, and replace them with the bytes
 								// from the corresponding record["_mjcasset_<sha>"] CKAsset field.
+								//
+								// Two defensive checks here:
+								//   1. If any markers remain after materialize (asset not yet downloaded,
+								//      fileURL nil, etc.), skip the update. The next poll re-fetches and
+								//      retries with whatever has settled.
+								//   2. If the record has CKAsset fields but the binary plist has ZERO
+								//      markers, the record is in a corrupted state — somebody uploaded
+								//      a stripped/text-only version of `key` while the asset fields
+								//      stayed behind. Accepting that update would propagate the
+								//      corruption to local data (consumer-side serialize/deserialize
+								//      would lose the NSData). Skip and force-push our local state.
 								else if ( [self isAssetPromotionEnabledForKey:key] ) {
-									NSArray *recordKeys = [record allKeys];
 									NSInteger assetFieldCount = 0;
-									for (NSString *k in recordKeys) {
+									for (NSString *k in [record allKeys]) {
 										if ( [k hasPrefix:kMJAssetFieldPrefix] ) assetFieldCount++;
 									}
-									DLog(@"download: materializing assets for key=%@; record has %ld asset fields", key, (long)assetFieldCount);
-									remoteObj = [MJCloudKitUserDefaultsSync materializeAssetsIn:remoteObj fromRecord:record];
+
+									NSInteger markersInPayload = 0;
+									NSMutableArray *stack = [NSMutableArray arrayWithObject:remoteObj];
+									while (stack.count) {
+										id v = stack.lastObject;
+										[stack removeLastObject];
+										if ([v isKindOfClass:[NSDictionary class]]) {
+											if ([(NSDictionary*)v objectForKey:kMJAssetRefKey]) markersInPayload++;
+											else { for (id k in [(NSDictionary*)v allKeys]) [stack addObject:[(NSDictionary*)v objectForKey:k]]; }
+										} else if ([v isKindOfClass:[NSArray class]]) {
+											for (id e in (NSArray*)v) [stack addObject:e];
+										}
+									}
+
+									if ( assetFieldCount > 0 && markersInPayload == 0 ) {
+										// Corruption signature — record has assets but the payload doesn't
+										// reference any of them. Refuse the update and trigger a push so we
+										// re-write the record from our (presumed-good) local state.
+										DLog(@"download: record for key=%@ has %ld asset fields but 0 markers in payload — corruption signature, refusing update and re-pushing local",
+										     key, (long)assetFieldCount);
+										skip = YES;
+										dispatch_async(dispatch_get_main_queue(), ^{
+											[self updateToiCloud:nil];
+										});
+									}
+									else {
+										remoteObj = [MJCloudKitUserDefaultsSync materializeAssetsIn:remoteObj fromRecord:record];
+										// After materialize, any markers that couldn't be resolved indicate a
+										// transient failure — skip and wait for the next poll.
+										NSInteger markersRemaining = 0;
+										stack = [NSMutableArray arrayWithObject:remoteObj];
+										while (stack.count) {
+											id v = stack.lastObject;
+											[stack removeLastObject];
+											if ([v isKindOfClass:[NSDictionary class]]) {
+												if ([(NSDictionary*)v objectForKey:kMJAssetRefKey]) markersRemaining++;
+												else { for (id k in [(NSDictionary*)v allKeys]) [stack addObject:[(NSDictionary*)v objectForKey:k]]; }
+											} else if ([v isKindOfClass:[NSArray class]]) {
+												for (id e in (NSArray*)v) [stack addObject:e];
+											}
+										}
+										if ( markersRemaining > 0 ) {
+											DLog(@"download: %ld marker(s) failed to materialize for key=%@; skipping setObject this round", (long)markersRemaining, key);
+											skip = YES;
+										}
+									}
 								}
 							}
 

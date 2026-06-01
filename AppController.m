@@ -22,6 +22,7 @@
 #import "MJCloudKitUserDefaultsSync/MJCloudKitUserDefaultsSync.h"
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <CoreServices/CoreServices.h>
 #import <ServiceManagement/ServiceManagement.h>
 
 @implementation AppController
@@ -863,13 +864,32 @@
 {
     NSString *type = [jcPasteboard availableTypeFromArray:[NSArray arrayWithObject:NSStringPboardType]];
 
-    // Image detection: only kick in when there's no string content on the pasteboard. Most copies that
-    // include both (e.g. Preview "Copy" of a selection) prefer the text representation; pure image copies
-    // (screenshots, Photos drag, Figma export) have no NSStringPboardType.
     BOOL captureImages = [[NSUserDefaults standardUserDefaults] boolForKey:@"captureImages"];
     NSString *imageType = nil;
-    if ( captureImages && type == nil ) {
-        imageType = [jcPasteboard availableTypeFromArray:@[NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
+    NSURL *singleImageFileURL = nil;
+    NSString *singleImageFileUTI = nil;
+    if ( captureImages ) {
+        // Pure-image case (no string on pasteboard): screenshots, Photos drag, Figma export, etc.
+        if ( type == nil )
+            imageType = [jcPasteboard availableTypeFromArray:@[NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
+
+        // Finder case: Cmd+C on a file in Finder puts a file URL (and a string fallback) on the
+        // pasteboard, but no inline image bytes. If exactly one file is selected AND it's an image,
+        // promote it to an image clipping instead of capturing the path text. Multi-file selections
+        // and non-image files fall through to the normal text-capture path.
+        if ( imageType == nil ) {
+            NSArray *urls = [jcPasteboard readObjectsForClasses:@[[NSURL class]]
+                                                       options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+            if ( urls.count == 1 ) {
+                NSURL *url = (NSURL *)urls.firstObject;
+                NSString *uti = nil;
+                [url getResourceValue:&uti forKey:NSURLTypeIdentifierKey error:nil];
+                if ( uti && UTTypeConformsTo((__bridge CFStringRef)uti, kUTTypeImage) ) {
+                    singleImageFileURL = url;
+                    singleImageFileUTI = uti;
+                }
+            }
+        }
     }
 
     if ( [pbCount intValue] != [jcPasteboard changeCount] && ![flycutOperator storeDisabled] ) {
@@ -877,7 +897,45 @@
         // Probably poor coding technique, but pollPB should be the only thing messing with pbCount, so it should be okay
         [pbCount release];
         pbCount = [[NSNumber numberWithInt:[jcPasteboard changeCount]] retain];
-        if ( type != nil ) {
+        if ( singleImageFileURL != nil ) {
+            // Single image file selected in Finder (or any other source that puts one file URL on the
+            // pasteboard). Read the file bytes and capture as an image clipping, overriding the
+            // filename-as-text capture that would otherwise happen.
+            NSRunningApplication *currRunningApp = nil;
+            for (NSRunningApplication *currApp in [[NSWorkspace sharedWorkspace] runningApplications])
+                if ([currApp isActive])
+                    currRunningApp = currApp;
+            NSURL *url = [singleImageFileURL retain];
+            NSString *uti = [singleImageFileUTI retain];
+
+            dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+            dispatch_async(queue, ^{
+                NSData *imageData = [NSData dataWithContentsOfURL:url];
+                [url release];
+                if ( imageData == nil || [imageData length] == 0 ) {
+                    DLog(@"Finder image read failed for %@", url.path);
+                    [uti release];
+                    return;
+                }
+
+                NSInteger maxKB = [[NSUserDefaults standardUserDefaults] integerForKey:@"maxImageClippingKB"];
+                if ( maxKB > 0 && [imageData length] > (NSUInteger)(maxKB * 1024) ) {
+                    DLog(@"Finder image skipped: %lu bytes exceeds %ld KB limit", (unsigned long)[imageData length], (long)maxKB);
+                    [uti release];
+                    return;
+                }
+
+                if ( ! [pbCount isEqualTo:pbBlockCount] ) {
+                    [flycutOperator addImageClipping:imageData
+                                              ofType:uti
+                                             fromApp:[currRunningApp localizedName]
+                                    withAppBundleURL:currRunningApp.bundleURL.path
+                                              target:self
+                               clippingAddedSelector:@selector(updateMenu)];
+                }
+                [uti release];
+            });
+        } else if ( type != nil ) {
 			NSRunningApplication *currRunningApp = nil;
 			for (NSRunningApplication *currApp in [[NSWorkspace sharedWorkspace] runningApplications])
 				if ([currApp isActive])

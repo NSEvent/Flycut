@@ -45,9 +45,14 @@ static NSString *const recordName = @"UserDefaults";
 // Marker keys used when promoting an NSData value to a CKAsset on the same record.
 // The dict-shaped marker replaces the NSData in the binary plist; the asset itself
 // lives in a CKRecord field named "<assetFieldPrefix><sha256-hex>".
+//
+// CKRecord rejects field names that start with an underscore — that namespace is reserved
+// for system fields (_etag, _creator, etc.) — so the field prefix uses a plain "mj_asset_".
+// The dict-internal marker keys can use any string since they're just NSDictionary keys
+// stored inside the binary plist; underscore prefixes are fine there.
 static NSString *const kMJAssetRefKey = @"_mjcasset_ref";
 static NSString *const kMJAssetSizeKey = @"_mjcasset_size";
-static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
+static NSString *const kMJAssetFieldPrefix = @"mj_asset_";
 
 @interface MJCloudKitUserDefaultsSync_NotificationHander : NSObject
 @end
@@ -465,8 +470,11 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 						dispatch_resume(syncQueue);
 						[db release];
 					}
-				else if ( ![[record recordChangeTag] isEqualToString:lastUpdateRecordChangeTagReceived] ) {
+				else if ( nil != record && ![[record recordChangeTag] isEqualToString:lastUpdateRecordChangeTagReceived] ) {
 					// We won't push our content if there is something we haven't received yet.
+					// (Skip this branch when record is nil — that's the "Record not found" first-time
+					// bootstrap case, where there's nothing remote to pull. Falling through to the
+					// success path below lets us create the record and upload.)
 
 					// Pull from iCloud now, pushing afterward.
 					[self updateFromiCloud:nil];
@@ -510,6 +518,7 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 									NSUInteger threshold = [self assetPromotionThresholdForKey:key];
 									NSMutableDictionary<NSString *, NSData *> *extracted = [NSMutableDictionary dictionary];
 									id stripped = [MJCloudKitUserDefaultsSync extractAssetsFrom:obj threshold:threshold into:extracted];
+									DLog(@"upload: asset promotion fired for key=%@ threshold=%lu extracted=%lu", key, (unsigned long)threshold, (unsigned long)extracted.count);
 									if ( extracted.count > 0 ) {
 										[self attachAssets:extracted toRecord:record];
 										obj = stripped;
@@ -745,35 +754,44 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 		if ( data.length >= thresholdBytes ) {
 			NSString *sha = [self sha256HexOfData:data];
 			[outAssets setObject:data forKey:sha];
-			return @{ kMJAssetRefKey: sha,
-			          kMJAssetSizeKey: [NSNumber numberWithUnsignedInteger:data.length] };
+			NSDictionary *marker = [NSDictionary dictionaryWithObjectsAndKeys:
+			                        sha, kMJAssetRefKey,
+			                        [NSNumber numberWithUnsignedInteger:data.length], kMJAssetSizeKey,
+			                        nil];
+			return marker;
 		}
 		return data;
 	}
+	// Containers below: build the mutable copy with an explicit +1 retain (no __block, no autorelease
+	// inside loops) and only autorelease once on the way out. The block-based / autorelease-inside-
+	// __block-assignment pattern crashed under MRC.
 	if ( [obj isKindOfClass:[NSDictionary class]] ) {
 		NSDictionary *src = (NSDictionary *)obj;
-		__block NSMutableDictionary *dst = nil;
-		[src enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+		NSMutableDictionary *dst = nil;
+		for (id k in [src allKeys]) {
+			id v = [src objectForKey:k];
 			id replacement = [self extractAssetsFrom:v threshold:thresholdBytes into:outAssets];
 			if ( replacement != v ) {
-				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				if ( !dst ) dst = [src mutableCopy];
 				[dst setObject:replacement forKey:k];
 			}
-		}];
-		return dst ? dst : src;
+		}
+		if ( dst ) return [dst autorelease];
+		return src;
 	}
 	if ( [obj isKindOfClass:[NSArray class]] ) {
 		NSArray *src = (NSArray *)obj;
 		NSMutableArray *dst = nil;
 		for (NSUInteger i = 0; i < src.count; i++) {
-			id v = src[i];
+			id v = [src objectAtIndex:i];
 			id replacement = [self extractAssetsFrom:v threshold:thresholdBytes into:outAssets];
 			if ( replacement != v ) {
-				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				if ( !dst ) dst = [src mutableCopy];
 				[dst replaceObjectAtIndex:i withObject:replacement];
 			}
 		}
-		return dst ? dst : src;
+		if ( dst ) return [dst autorelease];
+		return src;
 	}
 	return obj;
 }
@@ -796,28 +814,31 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 			DLog(@"Asset materialize failed for ref %@; leaving marker in place", ref);
 			return src;
 		}
-		__block NSMutableDictionary *dst = nil;
-		[src enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+		NSMutableDictionary *dst = nil;
+		for (id k in [src allKeys]) {
+			id v = [src objectForKey:k];
 			id replacement = [self materializeAssetsIn:v fromRecord:record];
 			if ( replacement != v ) {
-				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				if ( !dst ) dst = [src mutableCopy];
 				[dst setObject:replacement forKey:k];
 			}
-		}];
-		return dst ? dst : src;
+		}
+		if ( dst ) return [dst autorelease];
+		return src;
 	}
 	if ( [obj isKindOfClass:[NSArray class]] ) {
 		NSArray *src = (NSArray *)obj;
 		NSMutableArray *dst = nil;
 		for (NSUInteger i = 0; i < src.count; i++) {
-			id v = src[i];
+			id v = [src objectAtIndex:i];
 			id replacement = [self materializeAssetsIn:v fromRecord:record];
 			if ( replacement != v ) {
-				if ( !dst ) dst = [[src mutableCopy] autorelease];
+				if ( !dst ) dst = [src mutableCopy];
 				[dst replaceObjectAtIndex:i withObject:replacement];
 			}
 		}
-		return dst ? dst : src;
+		if ( dst ) return [dst autorelease];
+		return src;
 	}
 	return obj;
 }
@@ -829,26 +850,28 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 	if ( !pendingAssetTempFiles )
 		pendingAssetTempFiles = [[NSMutableArray alloc] init];
 
+	DLog(@"attachAssets: count=%lu", (unsigned long)assets.count);
 	[assets enumerateKeysAndObjectsUsingBlock:^(NSString *sha, NSData *data, BOOL *stop) {
 		NSString *fieldName = [kMJAssetFieldPrefix stringByAppendingString:sha];
 		// If the existing record already has a matching asset (same sha => same content), skip the rewrite.
 		// CKAsset doesn't expose a stable identifier, so we infer "already there" purely by field presence;
 		// if a different upload had the same sha it would have to be byte-equal anyway.
 		if ( [record objectForKey:fieldName] ) {
-			DLog(@"Asset %@ already on record; skipping re-attach", sha);
+			DLog(@"Asset %@ already on record; skipping re-attach (bytes=%lu)", sha, (unsigned long)data.length);
 			return;
 		}
 		NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
 		                     [NSString stringWithFormat:@"mjcasset_%@_%@.bin", sha, [[NSUUID UUID] UUIDString]]];
 		NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
 		if ( ![data writeToURL:tmpURL atomically:YES] ) {
-			DLog(@"Failed to write temp file for asset %@", sha);
+			ALog(@"Failed to write temp file for asset %@", sha);
 			return;
 		}
 		[pendingAssetTempFiles addObject:tmpURL];
 		CKAsset *asset = [[CKAsset alloc] initWithFileURL:tmpURL];
 		[record setObject:asset forKey:fieldName];
 		[asset release];
+		DLog(@"attachAssets: wrote asset %@ bytes=%lu field=%@", sha, (unsigned long)data.length, fieldName);
 	}];
 }
 
@@ -896,6 +919,29 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 			if (error) {
 				// Error handling for failed fetch from public database
 				DLog(@"CloudKit Fetch failure: %@", error.localizedDescription);
+				// "Record not found" is the first-time-bootstrap case: there's simply nothing on
+				// iCloud yet. We're free to push our local content up. If we leave the flag stuck
+				// at YES (the original behavior) the upload deadlocks forever. Clear it so the
+				// next NSUserDefaultsDidChangeNotification can fire updateToiCloud:.
+				NSString *errDesc = [error.userInfo objectForKey:@"ServerErrorDescription"];
+				if ( [errDesc isEqualToString:@"Record not found"] ) {
+					refuseUpdateToICloudUntilAfterUpdateFromICloud = NO;
+					// Re-attach the NSUserDefaultsDidChangeNotification observer in case it was
+					// removed by a prior attempt. The success branch below adds it via the same
+					// addObserver: call.
+					[[NSNotificationCenter defaultCenter] removeObserver:self
+					                                                name:NSUserDefaultsDidChangeNotification
+					                                              object:nil];
+					[[NSNotificationCenter defaultCenter] addObserver:self
+					                                         selector:@selector(updateToiCloud:)
+					                                             name:NSUserDefaultsDidChangeNotification
+					                                           object:nil];
+					// Trigger an immediate upload of whatever we have locally, so the schema gets
+					// bootstrapped without waiting for the next defaults change.
+					dispatch_async(dispatch_get_main_queue(), ^{
+						[self updateToiCloud:nil];
+					});
+				}
 			}
 			else {
 				[self updateLastRecordReceived:record];
@@ -968,6 +1014,12 @@ static NSString *const kMJAssetFieldPrefix = @"_mjcasset_";
 								// dict, find {_mjcasset_ref: sha} markers, and replace them with the bytes
 								// from the corresponding record["_mjcasset_<sha>"] CKAsset field.
 								else if ( [self isAssetPromotionEnabledForKey:key] ) {
+									NSArray *recordKeys = [record allKeys];
+									NSInteger assetFieldCount = 0;
+									for (NSString *k in recordKeys) {
+										if ( [k hasPrefix:kMJAssetFieldPrefix] ) assetFieldCount++;
+									}
+									DLog(@"download: materializing assets for key=%@; record has %ld asset fields", key, (long)assetFieldCount);
 									remoteObj = [MJCloudKitUserDefaultsSync materializeAssetsIn:remoteObj fromRecord:record];
 								}
 							}
@@ -1438,8 +1490,14 @@ withContainerIdentifier:(nonnull NSString *)containerIdentifier {
 				[privateDB saveSubscription:subscription completionHandler:^(CKSubscription * _Nullable subscription, NSError * _Nullable error) {
 					DLog(@"Saved subscription.");
 					if ( nil != error ) {
-						DLog(@"CloudKit Subscription failure: %@", error.localizedDescription);
-						[self stopObservingActivity];
+						// Don't tear down on subscription failure. A fresh CloudKit container hits a
+						// chicken-and-egg here: CKQuerySubscription requires the record type to exist,
+						// but the record type is created only on first record save. Tearing down kills
+						// the NSUserDefaultsDidChangeNotification listener that drives uploads — so the
+						// first record never gets saved and we deadlock. Leave the listener in place;
+						// the monitorSubscriptionTimer (set up below) will re-attempt subscription on
+						// a 60s cadence, succeeding once a record exists.
+						DLog(@"CloudKit Subscription failure (continuing without push notifications, monitor timer will retry): %@", error.localizedDescription);
 					}
 					dispatch_resume(startStopQueue);
 				}];

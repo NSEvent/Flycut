@@ -860,6 +860,65 @@
     return NO;    // Default handling of the command
 }
 
+// Heuristic: does this pasteboard string look like a single image filename (no path, recognized
+// image extension)? Used to gate the Finder-selection lookup in pollPB:.
+-(BOOL)contentsLooksLikeSingleImageFilename:(NSString *)s
+{
+    if ( s == nil || s.length == 0 || s.length > 256 ) return NO;
+    if ( [s rangeOfString:@"/"].location != NSNotFound ) return NO;
+    if ( [s rangeOfString:@"\n"].location != NSNotFound ) return NO;
+    NSString *ext = [[s pathExtension] lowercaseString];
+    if ( ext.length == 0 ) return NO;
+    static NSSet *imageExts = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        imageExts = [[NSSet alloc] initWithArray:@[@"png", @"jpg", @"jpeg", @"gif", @"tiff", @"tif",
+                                                   @"bmp", @"webp", @"heic", @"heif"]];
+    });
+    return [imageExts containsObject:ext];
+}
+
+// Ask Finder via AppleScript for its current selection. If exactly one selected item has the given
+// filename as its lastPathComponent AND is an image (UTI conforms to public.image), return its
+// POSIX path. Otherwise return nil. The first call triggers macOS's Apple Events permission prompt
+// for Finder; subsequent calls are silent.
+-(NSString *)pathToImageInFinderSelectionMatching:(NSString *)filename
+{
+    static NSAppleScript *script = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *src = @"tell application \"Finder\"\n"
+                        @"  set sel to selection\n"
+                        @"  set paths to {}\n"
+                        @"  repeat with i in sel\n"
+                        @"    try\n"
+                        @"      set end of paths to POSIX path of (i as alias)\n"
+                        @"    end try\n"
+                        @"  end repeat\n"
+                        @"  return paths\n"
+                        @"end tell";
+        script = [[NSAppleScript alloc] initWithSource:src];
+    });
+    NSDictionary *err = nil;
+    NSAppleEventDescriptor *result = [script executeAndReturnError:&err];
+    if ( err != nil ) {
+        DLog(@"Finder selection query failed: %@", err);
+        return nil;
+    }
+    // result is a list (typeAEList). Require exactly one entry to satisfy the "single image" rule.
+    if ( [result numberOfItems] != 1 ) return nil;
+    NSAppleEventDescriptor *item = [result descriptorAtIndex:1]; // AppleEvent lists are 1-indexed
+    NSString *path = [item stringValue];
+    if ( path == nil || path.length == 0 ) return nil;
+    if ( ![[path lastPathComponent] isEqualToString:filename] ) return nil;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    NSString *uti = nil;
+    [url getResourceValue:&uti forKey:NSURLTypeIdentifierKey error:nil];
+    if ( uti == nil ) return nil;
+    if ( !UTTypeConformsTo((__bridge CFStringRef)uti, kUTTypeImage) ) return nil;
+    return path;
+}
+
 -(void)pollPB:(NSTimer *)timer
 {
     NSString *type = [jcPasteboard availableTypeFromArray:[NSArray arrayWithObject:NSStringPboardType]];
@@ -960,6 +1019,55 @@
 				if ( contents == nil || [flycutOperator shouldSkip:contents ofType:[jcPasteboard availableTypeFromArray:[NSArray arrayWithObject:NSStringPboardType]] fromAvailableTypes:[jcPasteboard types]] ) {
                    DLog(@"Contents: Empty or skipped");
                } else if ( ! [pbCount isEqualTo:pbBlockCount] ) {
+                   // When the user does Cmd+C on an image file in Finder, Finder writes the filename
+                   // string to the pasteboard FIRST and then the file URL — often with a >1s gap. Our
+                   // 1s pollPB can race the second write and capture the text alone. We can't rely on
+                   // the next pollPB tick to handle the image, because pbCount was already advanced
+                   // when we entered this block. So when the text content looks like an image filename,
+                   // wait briefly, re-check the pasteboard, and if a matching file URL has appeared
+                   // capture the image RIGHT HERE — skipping the text capture entirely.
+                   BOOL looksLikeImg = captureImages && [self contentsLooksLikeSingleImageFilename:contents];
+                   NSURL *raceFileURL = nil;
+                   if ( looksLikeImg ) {
+                       [NSThread sleepForTimeInterval:0.35];
+                       NSArray *urls = [jcPasteboard readObjectsForClasses:@[[NSURL class]]
+                                                                  options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+                       if ( urls.count == 1 ) {
+                           NSURL *url = (NSURL *)urls.firstObject;
+                           if ( [[url lastPathComponent] isEqualToString:contents] ) {
+                               raceFileURL = url;
+                           }
+                       }
+                   }
+
+                   if ( raceFileURL == nil && looksLikeImg ) {
+                       // Right-click → Copy 'filename' case: only the filename string ever shows up
+                       // on the pasteboard. Ask Finder for its current selection as a best-effort
+                       // fallback; if it has the matching image file selected, use that path.
+                       NSString *finderImagePath = [self pathToImageInFinderSelectionMatching:contents];
+                       if ( finderImagePath != nil ) {
+                           raceFileURL = [NSURL fileURLWithPath:finderImagePath];
+                       }
+                   }
+
+                   if ( raceFileURL != nil ) {
+                       NSString *uti = nil;
+                       [raceFileURL getResourceValue:&uti forKey:NSURLTypeIdentifierKey error:nil];
+                       NSData *imageData = [NSData dataWithContentsOfURL:raceFileURL];
+                       NSInteger maxKB = [[NSUserDefaults standardUserDefaults] integerForKey:@"maxImageClippingKB"];
+                       if ( imageData && imageData.length > 0
+                            && (maxKB <= 0 || imageData.length <= (NSUInteger)(maxKB * 1024))
+                            && uti != nil ) {
+                           [flycutOperator addImageClipping:imageData
+                                                     ofType:uti
+                                                    fromApp:[currRunningApp localizedName]
+                                           withAppBundleURL:currRunningApp.bundleURL.path
+                                                     target:self
+                                      clippingAddedSelector:@selector(updateMenu)];
+                           return;
+                       }
+                       // Image capture failed (file unreadable, oversized, etc.) — fall through to text.
+                   }
                    [flycutOperator addClipping:contents ofType:type fromApp:[currRunningApp localizedName] withAppBundleURL:currRunningApp.bundleURL.path target:self clippingAddedSelector:@selector(updateMenu)];
                }
             });

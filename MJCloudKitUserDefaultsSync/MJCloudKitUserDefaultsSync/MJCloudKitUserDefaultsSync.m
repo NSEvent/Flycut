@@ -918,26 +918,33 @@ static NSString *const kMJAssetFieldPrefix = @"mj_asset_";
 		[db fetchRecordWithID:recordID completionHandler:^(CKRecord *record, NSError *error) {
 			if (error) {
 				// Error handling for failed fetch from public database
-				DLog(@"CloudKit Fetch failure: %@", error.localizedDescription);
-				// "Record not found" is the first-time-bootstrap case: there's simply nothing on
-				// iCloud yet. We're free to push our local content up. If we leave the flag stuck
-				// at YES (the original behavior) the upload deadlocks forever. Clear it so the
-				// next NSUserDefaultsDidChangeNotification can fire updateToiCloud:.
+				DLog(@"CloudKit Fetch failure: domain=%@ code=%ld desc=%@ userInfo=%@",
+				     error.domain, (long)error.code, error.localizedDescription, error.userInfo);
+				// Leaving the refuse flag stuck at YES deadlocks all future uploads. Always clear it
+				// after a fetch attempt so the next NSUserDefaultsDidChangeNotification can fire
+				// updateToiCloud:. The trade-off: in a transient network failure case we might end up
+				// pushing local state over a newer remote — but the previous behavior (sync silently
+				// stalls forever) is worse for the user.
+				//
+				// Asset-related fetch failures ("Fetching asset failed", "Moving downloaded asset
+				// failed") hit this path frequently in practice — CloudKit treats any sub-asset
+				// problem as a whole-fetch failure, even though the record metadata itself is fine.
+				refuseUpdateToICloudUntilAfterUpdateFromICloud = NO;
+				// Re-attach the NSUserDefaultsDidChangeNotification observer in case a prior fetch
+				// attempt removed it. The success branch below adds it via the same addObserver: call.
+				[[NSNotificationCenter defaultCenter] removeObserver:self
+				                                                name:NSUserDefaultsDidChangeNotification
+				                                              object:nil];
+				[[NSNotificationCenter defaultCenter] addObserver:self
+				                                         selector:@selector(updateToiCloud:)
+				                                             name:NSUserDefaultsDidChangeNotification
+				                                           object:nil];
+				// On the first-time-bootstrap "Record not found" path specifically, trigger an
+				// immediate upload so the schema gets created without waiting for another defaults
+				// change. On other fetch failures don't auto-trigger — the existing local state
+				// will sync on the next defaults change, which is usually a few seconds away.
 				NSString *errDesc = [error.userInfo objectForKey:@"ServerErrorDescription"];
 				if ( [errDesc isEqualToString:@"Record not found"] ) {
-					refuseUpdateToICloudUntilAfterUpdateFromICloud = NO;
-					// Re-attach the NSUserDefaultsDidChangeNotification observer in case it was
-					// removed by a prior attempt. The success branch below adds it via the same
-					// addObserver: call.
-					[[NSNotificationCenter defaultCenter] removeObserver:self
-					                                                name:NSUserDefaultsDidChangeNotification
-					                                              object:nil];
-					[[NSNotificationCenter defaultCenter] addObserver:self
-					                                         selector:@selector(updateToiCloud:)
-					                                             name:NSUserDefaultsDidChangeNotification
-					                                           object:nil];
-					// Trigger an immediate upload of whatever we have locally, so the schema gets
-					// bootstrapped without waiting for the next defaults change.
 					dispatch_async(dispatch_get_main_queue(), ^{
 						[self updateToiCloud:nil];
 					});

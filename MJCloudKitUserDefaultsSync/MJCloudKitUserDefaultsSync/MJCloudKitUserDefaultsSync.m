@@ -1556,6 +1556,15 @@ withContainerIdentifier:(nonnull NSString *)containerIdentifier {
 }
 
 - (void)monitorSubscription:(NSTimer *)timer {
+	// Always poll for changes from iCloud on this cadence — even when our CKQuerySubscription is
+	// alive and reportedly working. CloudKit's APNs-driven push delivery is best-effort: pushes can
+	// be silently dropped (network blip, system Sleep, throttling, the device just deciding not to),
+	// and without a fallback the receiving side never picks up records that other devices uploaded.
+	// 60s of staleness is acceptable; sync-stalled-forever isn't.
+	if ( observingActivity ) {
+		[self checkCloudKitUpdates];
+	}
+
 	[privateDB fetchSubscriptionWithID:subscriptionID completionHandler:^(CKSubscription * _Nullable existingSubscription, NSError * _Nullable error) {
 		BOOL noSubscription = (nil == existingSubscription);
 		if ( observingActivity && noSubscription )
